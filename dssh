@@ -1,0 +1,1678 @@
+#!/usr/bin/perl -w
+
+# --------------------------------------------------------------------
+#  dssh
+#
+#  Author        : alexdepalex
+#  Date          : $Date$
+#  Location      : dssh
+#  Misc info     : 
+#                : 
+#
+#  RCS info
+#  Last check in : $Author: Alex $
+#  Revision      : $Revision: 2.24 $
+#  File          : $Source: /Users/Alex/CVSRep/dssh/dssh,v $
+#  State         : $State: Exp $
+#  Locked by     : $Locker:  $
+#
+#  Exit info     : 1  - Display usage
+#                  2  - Couldn't redirect STDOUT from command
+#                  3  - Couldn't redirect STDERR from command
+#                  4  - dssh called with wrong name. Check symbolic links
+#                  5  - Caught interrupt signal
+#                  6  - Couldn't find ssh
+#                  7  - Couldn't find scp
+#                  8  - Group definition isn't correct
+#                  9  - No hosts defined
+#                  10 - Exceeded maximum number of hosts
+#                  11 - Command can't be executed on more than X hosts
+#
+#  Revision information :
+#  $Log: dssh,v $
+# --------------------------------------------------------------------
+
+use strict;
+use File::Basename;
+use Getopt::Long;
+
+# -|Variables declaration|--------------------------------------------
+
+# Forgot what this one does, but I'll leave it in
+my $globalDiff = 5;
+
+# Alarm time for pipes
+my $waitPipes = 5;
+
+# Host warning threshold
+my $hostLimit = 50;
+
+# Declare hashes for child pipes
+my (%rOut, %wOut, %rErr, %wErr); 
+
+my $killSig = 'TERM';
+my $sep="-------------------------------------------------------------------------------";
+my $hostSep = "HOSTS -------------------------------------------------------------------------";
+my ($command, $filename, $destFilename, $copyCommand);
+
+my (@hostList, @hostOutput, @pids, @scpOpts, @sshOpts);
+
+# dssh will search these paths for ssh and scp binaries
+my @searchPath =(	"/usr/bin",
+			"/usr/local/bin",
+			"/appl/tsu/bin"
+		);
+
+# Commands which should not be executed on more than X hosts at the same time
+my %hotList =	(
+			'\bhalt\b\s*[\-q]*'	=> 1,
+			'\bshutdown\b\s*[Ffr]*' => 1
+		);
+
+# Will show the activity bar if set to 1. You can also use the
+# -a parameter
+my $activityCounter = 0;
+my @activity = ("\e[D-","\e[D\\","\e[D|","\e[D/");
+
+# Set program basename which will be used in the usage message
+my $progName = basename ($0);
+
+# Set user home directory. Will be used for the user configuration file
+my $uHome = (getpwuid("$<"))[7];
+
+# Configuration hash
+my %co;
+
+# When the ALRM exception is raised (through the alarm command)
+# the command 'die "timeout' will be executed.
+$SIG{'ALRM'} = sub { die "timeout" };
+
+# When the INT exception is raised (^C), the sub cleanUp will
+# be executed which will kill all forked childs.
+$SIG{'INT'} = \&cleanUp;
+# --
+
+# -|printActivity|----------------------------------------------------
+# Prints a string from the activity array
+# Pre: reference to a counter which hold the activity array element
+# Post:
+# --------------------------------------------------------------------
+sub printActivity ($) {
+	my $rActivityCounter = shift;
+	$|=1;
+	print ($activity[$$rActivityCounter]);
+	$$rActivityCounter++;
+	$$rActivityCounter = 0 if ($$rActivityCounter > (@activity - 1));
+}
+
+
+# -|checkCommand|-----------------------------------------------------
+# Checks if an actual command has been given.
+# Empty commands, or commands containing only spaces, are not allowed.
+# Pre: string containing the command
+# Post: 0 - if command is valid
+#       1 - if command is invalid
+# --------------------------------------------------------------------
+sub checkCommand ($$$) {
+	my $command = shift;
+	my $rHotList = shift;
+	my $nrHosts = shift;
+	my $reg;
+
+	debug ("-- Entering checkCommand");
+
+	if ($co{'checkLimit'} && $rHotList) {
+		debug ("Found hotList");
+		foreach $reg (keys (%$rHotList)) {
+			debug ("Checking if command \"$command\" contains \"$reg\"");
+			if (($command =~ /$reg/) && ($nrHosts > $rHotList->{$reg})) {
+				error ("The command \"$command\" can't be executed on more than ".
+					$rHotList->{$reg}." hosts without specifying the -y parameter.");
+				exit (11);
+			} elsif ($command =~ /$reg/) {
+				debug ("Yes we are, but our number of hosts ($nrHosts) is less than ".
+					$rHotList->{$reg});
+			} else {
+				debug ("No match");
+			}
+		}
+
+		# If we get here, the command was correct.
+		return (0);
+	} else {
+		return ($command =~ m/^\s+$/);
+	}
+
+	debug ("--");
+}
+
+
+# -|checkCopySource|--------------------------------------------------
+# Checks if the parameter given is really a file.
+# Pre: string containing the file
+# Post: 0 - if file is invalid
+#       1 - if file is valid
+# --------------------------------------------------------------------
+sub checkCopySource ($;$) {
+	my $sourceFile = shift;
+	my $recursiveCopy = shift;
+
+	debug ("-- checkCopySource");
+
+	# We don't need an empty sourcefile, so return if we have one
+	return 1 if ($sourceFile =~ m/^\s+$/);
+
+	# We should check if the parameter given wasn't a directory.
+	# If it is, the user should use the recursive options.
+	if ( ( -d $sourceFile ) && (! $recursiveCopy ) ) {
+		usage ("You're trying to copy a directory without the -r flag. Please correct.");
+	} elsif ( ( -f $sourceFile) || ( -d $sourceFile) ) {
+		return 0;
+	}
+
+	debug ("--");
+
+	return 1;	
+}
+
+
+# -|cleanHosts|-------------------------------------------------------
+# Removes the newline from the hostsnames, deletes hostnames which
+# are hashed out or invalid and removes comments.
+# Pre: Array containing hostnames
+# Post: Cleaned array containing hostnames
+# --------------------------------------------------------------------
+sub cleanHosts ($;$) {
+	my $rHosts = shift;
+	my $group = shift;
+	my @groups = @_;
+	my (%newHosts, %seen);
+	my (@newHostsList, @dupes, @excludes, @tmpHostsList);
+	my $host;
+
+	debug ("-- Entering cleanHosts");
+
+	chomp (@$rHosts);
+
+	@groups = split (",", $group) if $group;
+
+	debug ("Grouplist is \"".join (",",@groups)."\"");
+
+	foreach $host (@$rHosts) {
+		if (($host =~ m/^\s*@([\w\d]+):/)) {
+			$group = $1;
+			debug ("We've found group \"$group\"");
+
+			next if ($host !~ m/:([\w\d\-\.\,\s]+)[\s#]*/);
+			$host = $1;
+			# Removing spaces
+			$host =~ s/\s+//g;
+			debug ("Adding hosts \"$host\" to group $group");
+			push (@{$newHosts{$group}}, split(",", $host));
+
+		} elsif ($host =~ m/^\s*([\w\d\-\.]+)[\s#]*/) {
+			$host = $1;
+			debug ("$host survived scrubbing as $host");
+
+			push (@{$newHosts{'default'}}, $host);
+		} else {
+			debug ("Group line or syntax error on line \"$host\"");
+		}
+
+	}
+
+	if (! @groups) {
+		debug ("Grouplist was empty. Filling with all host groups");
+		push (@groups, keys(%newHosts)) if (! @groups);
+
+	}
+
+	foreach $group (@groups) {
+		if (defined(@{$newHosts{$group}})) {
+			debug ("Adding group $group to new host list");
+			push (@newHostsList, @{$newHosts{$group}});
+		} else {
+			debug ("Couldn't add group $group to host list. List is empty");
+		}
+	}
+
+	if ( $co{'paramHostEx'} ) {
+		debug ( "Removing hosts from exclude list" );
+		@excludes = parseHost ( $co{'paramHostEx'} );
+		debug ("Exclude list: ".join (',', @excludes));
+		foreach $host ( @newHostsList ) {
+			if ( grep { ! /^$host$/ } @excludes ) {
+				debug ("Host $host wasn't on exclude list. Adding");
+				push ( @tmpHostsList, $host );
+			} else {
+				debug ("Host $host was ON exclude list. Ignoring");
+			}
+		}
+
+		@newHostsList = @tmpHostsList;
+	}
+
+	debug ("Removing duplicates");
+	@newHostsList = grep { ! $seen{$_}++ } @newHostsList;
+
+	debug ("Creating list of duplicates");
+	foreach $host (sort(keys(%seen))) {
+		push (@dupes, $host) if $seen{$host} > 1;
+	}
+
+	warning ("Found duplicates in your hostfile: ".join (",", @dupes)) if (@dupes);
+
+	@$rHosts = sort (@newHostsList);
+
+	debug ("--");
+}
+
+
+# -|debug|------------------------------------------------------------
+# Prints a debug message to standard error whenever the $debug
+# variable is set.
+# Pre: Debug message
+# Post: -
+# --------------------------------------------------------------------
+sub debug ($) {
+	my $debugMessage = shift;
+	print (STDERR "DEBUG:$debugMessage\n") if $co{'debug'};
+}
+
+
+# -|warning|----------------------------------------------------------
+# Prints a warning message to standard output
+# Pre: Warning message
+# Post: -
+# --------------------------------------------------------------------
+sub warning ($) {
+	my $warningMessage = shift;
+	print (STDERR "WARNING:$warningMessage\n");
+}
+
+
+# -|error|------------------------------------------------------------
+# Prints an error message to standard error
+# Pre: Debug message
+# Post: -
+# --------------------------------------------------------------------
+sub error ($) {
+	my $debugMessage = shift;
+	print (STDERR "ERROR:$debugMessage\n");
+}
+
+
+# -|execCommand|------------------------------------------------------
+# Executes a given command on all the hosts defined in the array
+# Pre: Temporary dir
+#      Command to be executed
+#      Host List - Array containg all the hosts
+# Post: -
+# --------------------------------------------------------------------
+sub execCommand ($$$$$$@) {
+	my $rSshOpt = shift;
+	my $sshUser = shift;
+	my $sshCommand = shift;
+	my $maxChilds = shift;
+	my $activityBar = shift;
+	my $rActivityCounter = shift;
+	my $type = shift;
+	my @hostList = @_;	
+	my @execCommand;
+	my ($forkPid, $host);
+	local (*oldSTDOUT, *oldSTDERR);
+	my $nrChilds = 0;
+
+	debug ("-- Entering execCommand");
+
+	foreach $host (@hostList) {
+
+		if ($type eq "ssh") {
+			@execCommand = (@$rSshOpt, $sshUser."\@".$host, $sshCommand);
+		} elsif ($type eq "scp") {
+			@execCommand = (@$rSshOpt, $sshUser."\@".$host.":".$sshCommand);
+		} else {
+			next;
+		}
+
+	    	# Create filehandles for pipes
+		$rOut{$host} = "READ_STDOUT_".$host;
+		$wOut{$host} = "WRITE_STDOUT_".$host;
+		$rErr{$host} = "READ_STDERR_".$host;
+		$wErr{$host} = "WRITE_STDERR_".$host;
+
+		# The definition of the pipes needs to be done without the
+		# strict module. Perl thinks that we're making a mistake by
+		# using a string as a symbol ref, although this is exactly
+		# what we want.
+		{ no strict;
+
+		    if (pipe ($rOut{$host}, $wOut{$host}) < 0) {
+			error ("Couldn't open pipe for host $host. Skipping host.");
+			next;
+		    }
+
+		    if (pipe ($rErr{$host}, $wErr{$host}) < 0) {
+			error ("Couldn't open pipe for host $host. Skipping host.");
+			next;
+		    }
+		}
+
+		# Let's fork
+		if (!defined ($forkPid = fork())) {
+			error ("Couldn't fork command $command for host $host. This is very bad: $!");
+		} elsif (!$forkPid) {
+
+			# !!! This is the forked child code !!!
+
+		    	# Close child's end of the read pipes because we don't need them anymore.
+			close ($rOut{$host});
+			close ($rErr{$host});
+
+			eval {
+				# When the execution of the external command takes more than
+				# $timeout seconds, the program will continue and kill the command
+				alarm ($co{'timeout'});
+
+				debug ("Executing \"".join (" ", @execCommand)."\" on host \"$host\" with pid $$");
+			
+				# Create a copy of STDOUT and STDERR. The open statement creates a
+				# copy (not an alias) from the STDOUT filehandle to oldSTDOUT.
+				open (oldSTDOUT, ">&STDOUT");
+				open (oldSTDERR, ">&STDERR");
+
+				# Redirect STDOUT and STDERR to pipe. This is the same as what we've
+				# done before. $wOut{$host} contains a filehandle to a pipe, which
+				# we copy into STDOUT. From now on, all output which is send to STDOUT
+				# will go to $wOut{$host}. Same goes for the STDERR.
+				if (! open (STDOUT, ">&$wOut{$host}")) {
+				    error ("Couldn't redirect STDOUT to pipe $wOut{$host}. Exiting");
+				    exit (2);
+				}
+
+				if (! open (STDERR, ">&$wErr{$host}")) {
+					error ("Couldn't redirect STDERR to pipe $wErr{$host}. Exiting");
+					exit (3);
+				}
+
+				# Disable output buffering. If we don't disable buffering, some output
+				# might get lost.
+				select (STDOUT);
+				$| = 1;
+				select (STDERR);
+				$| = 1;
+
+				# Only execute the command if Exec is set
+				system (@execCommand) if ($co{'Exec'});
+
+				# Restore old STDOUT and STDERR file handles
+				# If we don't do this, the debug output will be part of the command output.
+		    		open (STDOUT, ">&oldSTDOUT");
+		    		open (STDERR, ">&oldSTDERR");
+				debug ("Ready processing host $host");
+
+				# Reset the alarm signal so that it won't get called
+				alarm (0);
+			};
+
+			# When the alarm signal has been called, the previous defined alarm sub
+			# will be called which immediately dies with the string "timeout". When
+			# $@ contains that string, the forked process needs to be killed.
+			if ($@) {
+				if ($@ =~ /timeout/) {
+					close (STDOUT);
+					close (STDERR);
+			    		open (STDOUT, ">&oldSTDOUT");
+			    		open (STDERR, ">&oldSTDERR");
+					error ("Executing command ".join (" ", @execCommand)." on host $host timed out. ".
+						"Attempting suicide. <BOOOOOM> $$");
+					kill $killSig, $$;
+				}
+			} else {
+			    		open (STDOUT, ">&oldSTDOUT");
+			    		open (STDERR, ">&oldSTDERR");
+					debug ("Successfully executed command ".join (" ", @execCommand)." on host $host.");
+			}
+
+			# Clean exit. Please notice that we're still the child process.
+			exit;
+		}
+
+		# Check how many childs are running
+		if ($forkPid) {
+		    	close ($wOut{$host});
+		    	close ($wErr{$host});
+
+			debug ("Pushing child process ID $forkPid to pids list");
+			push (@pids, $forkPid) if $forkPid > 1;
+
+			$nrChilds++;
+			# If the current number childs is equal or greater than the maximum number of
+			# childs, wait for one to die and substract one from the current number of childs.
+			if ($nrChilds >= $maxChilds) {
+				debug ("We have an equal number or more than $maxChilds child processes.");
+				debug ("Waiting for one to die.");
+				wait;
+				$nrChilds--;
+			}	
+		}
+
+		printActivity ($rActivityCounter) if ($activityBar);
+	}
+
+	debug ("--");
+
+	return ($nrChilds);
+}
+
+
+# -|createOutput|-----------------------------------------------------
+# Collects the output for all the hosts in the host list array in a
+# referenced array.
+# Pre: referenced host list
+#      referenced output array
+# Post: -
+# --------------------------------------------------------------------
+sub createOutput ($$) {
+	my $rHostList = shift;
+	my $rOutput = shift;
+	my ($ofh, $efh, $sout, $line, $host, $eLines, $oLines);
+	my $sin = '';
+
+	debug ("-- Entering createOutput");
+
+	foreach $host ( sort ( @$rHostList ) ) {
+		my $ofh = $rOut{$host};
+		my $efh = $rErr{$host};
+		$oLines = 0;
+		$eLines = 0;
+
+		debug ("Fetching output for host $host");
+		eval {
+			# It's possible that an SSH session fails, although the forked dssh script
+			# has been killed. In this case, this function will hang, until SSH times out.
+			# Too prevent this, we'll set an alarm which will skip this host if collecting
+			# the output takes too long
+			alarm ($waitPipes);
+
+			push (@$rOutput, "$sep\n$host - ".($command || $filename)."\n$sep\n") if $co{'pretty'};
+
+			# Check if both pipes contain a filehandle
+			if ((fileno ($ofh)) && (fileno ($efh))) {
+				debug ("We've found a FH for host $host");
+				# I really have no idea what this does
+				vec ($sin, fileno ($ofh), 1) = 1;
+				vec ($sin, fileno ($efh), 1) = 1;
+			} else {
+				debug ("Didn't find a FH for host $host. Skipping");
+				next;
+			}
+
+			# If we can't select the pipe for this host, skip it	
+			last if (select($sout = $sin, undef, undef, undef) == 0);
+
+			# Print output from STDERR first
+			debug ("Collecting STDERR output");
+			if (vec ($sout, fileno ($efh), 1)) {
+				while ($line = <$efh>) {
+					next if ((!$co{'showEmpty'}) && ($line =~ /^\s*$/));
+					$eLines++;
+					if ($co{'showErr'} && $co{'showHost'}) {
+						push (@$rOutput, "$host: $line");
+					} elsif ($co{'showErr'}) {
+						push (@$rOutput, $line);
+					}
+				}
+				# Hmmmmm
+				vec($sin, fileno($ofh), 1) = 0;
+			}
+
+			alarm (0);
+		};
+
+		if ($@ =~ /timeout/) {
+			error ("Couldn't read all STDERR output from command. Output may be incomplete.");
+		}
+
+		eval {
+			alarm ($waitPipes);
+
+			# Print output from STDOUT second
+			debug ("Collecting STDOUT output");
+			if (vec ($sout, fileno ($ofh), 1)) {
+				while ($line = <$ofh>) {
+					next if ((!$co{'showEmpty'}) && ($line =~ /^\s*$/));
+					$oLines++;
+					if ($co{'showOut'} && $co{'showHost'}) {
+						push (@$rOutput, "$host: $line");
+					} elsif ($co{'showOut'}) {
+						push (@$rOutput, $line);
+					}
+				}
+				vec($sin, fileno($ofh), 1) = 0;
+			}
+
+			# Check if host returned no output and add an empty host entry if necessary
+			# This will prevent the no pretty option, and also compress, to not display a
+			# host
+			if ( $co{'showOut'} && $co{'showHost'} && (  ( $eLines | $oLines ) == 0 ) ) {
+				debug ( "Host \"$host\" didn't produce any output. Appending empty output" );
+				push (@$rOutput, "$host:\n");
+			}
+
+			debug ("Closing FH's for $host");
+			close ($efh);
+			close ($ofh);
+
+			push (@$rOutput, "$sep\n\n") if $co{'pretty'};
+
+			alarm (0);
+		};
+
+		if ($@ =~ /timeout/) {
+			error ("Couldn't read all STDOUT output from command for host $host.".
+					" Output may be incomplete.");
+		}
+	}
+
+	debug ("--");
+}
+
+
+# -|usage|------------------------------------------------------------
+# Display the usage message and exits
+# Pre: The error message to display
+# Post: -
+# --------------------------------------------------------------------
+sub usage (;$) {
+	my $message = shift;
+
+	debug ("-- Entering usage");
+
+	# Print the usage message to standard error
+	select (STDERR);
+
+	if ($message) {
+		print ($progName.": $message\n");
+	} else {
+		print ($progName.' - $Id: dssh,v 2.24 2006/07/13 13:28:02 Alex Exp $'."\n");
+	}
+	print ("\ndssh [-w hosts | -W hosts]\n");
+	print ("     [-e hosts]\n");
+	print ("     [-f hostfile1,hostfile2]\n");
+	print ("     [-c | [[-a] [-ne] [-no] [-nl] [-np] [-no]]\n");
+	print ("     [-g server group] [-l login name]\n");
+	print ("     [-t time out] command\n\n");
+
+	print ("\t-h  : this message\n");
+	print ("\t-w  : specify separate hosts to replace the default list (comma separated)\n");
+	print ("\t-W  : specify separate hosts to append to the default list (comma separated)\n");
+	print ("\t-e  : specify separate hosts to exclude from the default list (comma separated)\n");
+	print ("\t-f  : specify an alternate host file (default ~/.sshcoll)\n");
+	print ("\t-q  : list the hosts (default hosts in ~/.sshcoll)\n");
+	print ("\t-a  : activity bar. Shows if $progName is performing an action\n");
+	print ("\t-b  : address to initiate connection from.\n");
+	print ("\t-l  : remote login name (defaults to effective user id)\n");
+	print ("\t-t  : specify the per process time out. (defaults to $co{'timeout'} seconds)\n");
+	print ("\t-c  : compress output (dshbak)\n");
+	print ("\t-g  : server group\n");
+	print ("\t-ne : omit stderr output\n");
+	print ("\t-no : omit stdout output\n");
+	print ("\t-nl : omit empty lines\n");
+	print ("\t-np : omit separators / no pretty output\n");
+	print ("\t-nh : omit hostname\n");
+	if ($progName =~ /dscp/) {
+		print ("\t-r  : copy directories recusively\n");
+	}
+
+	select (STDOUT);
+
+	debug ("--");
+
+	exit (1);
+}
+
+
+# -|listHosts|--------------------------------------------------------
+# Lists all hosts currently defined
+# Pre: An array containing all hosts
+# Post: -
+# --------------------------------------------------------------------
+sub listHosts (@) {
+	my @hosts = @_;
+	my $host;
+
+	debug ("-- Entering listHosts");
+
+ 	foreach $host (@hosts) {
+		print ("$host\n");
+	}
+
+	debug ("--");
+}
+
+
+# -|parseHost|--------------------------------------------------------
+# Parses the host argument
+# Pre: A string with comma separated hosts
+# Post: Array containing all the hosts
+# --------------------------------------------------------------------
+sub parseHost ($) {
+	my $hostLine = shift;
+
+	debug ("-- parseHost");
+
+	if (! ($hostLine =~ /\,/)) {
+		return ("$hostLine")
+	} else {
+		return (split (/\,/, $hostLine));
+	}
+
+	debug ("--");
+}
+
+
+# -|readHostList|-----------------------------------------------------
+# Read the given host file
+# Pre: filename of a file which contains one host per line
+# Post: Array containing all the hosts
+# --------------------------------------------------------------------
+sub readHostFile ($) {
+	my $hostListFile = shift;
+	my $file;
+	my @hostList;
+
+	debug ("-- readHostFile");
+
+	foreach $file (split (",", $hostListFile)) { 
+		debug ("Reading host file $file");
+		open (FH, "<".$file) || die ("Couldn't open $file :$!\n");
+	
+		# Munch munch.. Put the entire file in @hostList
+		push (@hostList, <FH>);
+
+		close (FH) || die ("Couldn't close $file :$!\n");	
+	}
+
+	debug ("--");
+
+	return (@hostList);
+}
+
+
+# -|readConf|---------------------------------------------------------
+# Process configuration file 
+# Pre: filename of the configuration file
+#      reference to a hash
+# --------------------------------------------------------------------
+sub readConf ($$) {
+	my $confFile = shift;
+	my $rConfHash = shift;
+	my $line;
+
+	debug("--> readConf");
+
+	open (CF, "<$confFile") || die ("Cound't open $confFile :$!\n");
+	while ($line = <CF>) {
+
+	    	# Skip line if it is empty, hashed out or isn't a valid
+		# config line.
+
+		if (($line =~ /^\s*$/) || ($line =~ /^\s*#/) || ($line !~ /^\s*(\w+)\s*=\s*([\w~\/\.\,]+)[\s#]*/)) {
+			debug ("Invalid config line at $. of $confFile") if $line !~ /^\s*#/;    
+			next;
+		};
+
+		debug ("Found a valid config line. Key=\"$1\", Value=\"$2\"");
+		$$rConfHash{$1} = $2;
+	}
+
+	close (CF);
+
+	debug("<-- readConf");
+}
+
+
+# -|printOutputCompress|----------------------------------------------
+# Prints output compressed (dshbak) style
+# Pre:  referenced array containing output
+# Post: -
+# --------------------------------------------------------------------
+sub printOutputCompress ($) {
+	my $rOutput = shift;
+	my ($line, $storedLine, $host, $counter, $id);
+	my $tmpLine = "";
+	my $curHost = "";
+	my $nrLines = -1;
+	my @output;
+	my %hostId;
+
+	debug ("-- Entering printOutputCompress");
+	
+	debug ("We're going to process ".@$rOutput." lines");
+
+	# Processing all lines + 1. The last bogus line will flush the last host being processed.
+	while ($nrLines < @$rOutput ) {
+
+		$nrLines++;
+
+		# If $line doesn't start with a valid hostname
+		# followed by a colon, skip it.
+
+		$host = "";
+		$line = undef;
+
+		# The last itteration will contain a line number which doesn't exists. Therefore,
+		# the host variable will be empty, which will flush the output for the host which
+		# is processed at the end.
+		if ( defined ( $$rOutput[$nrLines] ) ) {
+			next if ( ( $$rOutput[$nrLines] !~ /^([A-z0-9\.\-\_]+):\s*(.*)/ ) );
+			$host = $1 || "";
+			$line = $2 || undef;
+		}
+			
+		# If we're running through this loop for the first time, $curHost is
+		# empty and therefore the ouput of $host will be immediately processed.
+		# That's why we're assigning $host to $curHost only for the first itteration.
+		$curHost = $host if ($curHost eq "");
+
+		if ( ($host ne $curHost) ) {
+			debug ("Hosts aren't equal anymore \$host: $host and \$curHost: $curHost");
+			$counter = 0;
+
+			$tmpLine .= $line."\n" if ($host eq $curHost);
+
+			foreach $storedLine (@output) {
+				if ($storedLine ne $tmpLine) {
+					$counter ++;
+				} else {
+					debug ("Found a match in element $counter");
+					last;
+				}
+			}
+
+			if ($counter == @output) {
+				debug ("Pushing tmpLine for host $curHost");
+				push (@output, $tmpLine);
+				push (@{$hostId{@output-1}}, $curHost);
+			} else {
+				debug ("Pushing tmpLine for host $curHost in a new element");
+				push (@{$hostId{$counter}}, $curHost);
+			}
+
+			$curHost = $host;
+			$tmpLine = $line."\n" if defined ( $line );
+
+		} else {
+			$tmpLine .= $line."\n" if defined ( $line );
+		}
+	};
+
+	# Create output header
+	foreach $id (keys (%hostId)) {
+		debug ("Processing key $id");
+		print ($hostSep."\n");
+		$counter = 0;
+
+		# Only 4 hosts per line allowed, therefore we're printing a newline
+		# whenever 4 hosts have been printed.
+		foreach $host (@{$hostId{$id}}) {
+			print ("\n") if ($counter % 4 == 0) && ($counter != 0);
+			printf ("%-20.19s", $host);
+			$counter++;
+		}
+		print ("\n".$sep."\n".$output[$id]."$sep\n\n");
+	}
+
+	debug ("--");
+}
+
+
+# -|printOutput|------------------------------------------------------
+# Prints output
+# Pre:  referenced array containing output
+# Post: -
+# --------------------------------------------------------------------
+sub printOutput ($) {
+	my $rOutput = shift;
+	my $line;
+
+	debug ("-- Entering printOutput");
+
+	debug ("Found ".@$rOutput." lines to process");
+
+	foreach $line (@$rOutput) {
+		print ($line);
+	}
+
+	debug ("--");
+}
+
+
+# -|setDefaults|------------------------------------------------------
+# Set default options
+# Pre:  referenced configuration array
+# Post: -
+# --------------------------------------------------------------------
+sub setDefaults ($) {
+	my $co = shift;
+
+	debug ("-- Entering setDefaults");
+
+	$$co{'Exec'} = 1;
+	$$co{'timeout'} = 60;
+	$$co{'showErr'} = 1;
+	$$co{'showOut'} = 1;
+	$$co{'pretty'} = 1;
+	$$co{'showHost'} = 1;
+	$$co{'showEmpty'} = 1;
+	$$co{'user'} = (getpwuid("$<"))[0];
+	$$co{'sshCommand'} = 0;
+	$$co{'scpCommand'} = 0;
+
+	debug ("--");
+}
+
+
+# -|cleanUp|----------------------------------------------------------
+# Kill processes in array
+# Pre:  Array containing pids
+# Post: -
+# --------------------------------------------------------------------
+sub cleanUp {
+	my $pid;
+	my $killed = 0;
+
+	print (STDERR "CAUGHT INT SIGNAL -- Cleaning up - ");
+	debug ("-- Entering cleanUp");
+	foreach $pid (@pids) {
+		# Don't kill init or ourselves
+		if (($pid > 1) && ($pid != $$)) {
+			if (kill (0, $pid)) {
+				debug ("Process $pid is still alive. Killing 9");
+				kill (9, $pid);
+				$killed++;
+			} else {
+				debug ("Process $pid is already dead.");
+			}
+		} else {
+			debug ("We can't kill 0, 1 or $$ (which is me :) )");
+		}
+	}
+	debug ("Exiting !!!!\n");
+	print (STDERR "Killed $killed processes!\n");
+
+	debug ("--");
+	exit (5);
+}
+
+
+# -|findExec|---------------------------------------------------------
+# Pre:  referenced configuration array
+# Post: -
+# --------------------------------------------------------------------
+sub findExec ($@) {
+	my $exec = shift;
+	my @path = @_;
+	my $test;
+
+	debug ("-- findExec");
+
+	foreach $test (@path) {
+		debug ("Checking if \"$exec\" exists in path \"$test\"");
+		if ( ( -x $test."/".$exec ) && ( -f $test."/".$exec ) ) {
+			debug ("--");
+			return ($test."/".$exec);
+		}
+	}
+
+	debug ("--");
+
+	return (0);
+}
+
+
+# -|setOptions|-------------------------------------------------------
+# Set commandline configuration options which override default and
+# user config options
+# Pre:  referenced configuration array
+# Post: -
+# --------------------------------------------------------------------
+sub setOptions ($) {
+	my $co = shift;
+	my $noArgs;
+	my %args;
+
+	debug ("-- Entering setOptions");
+
+	# Check if we had any arguments
+	$noArgs = @ARGV;
+
+	# We should ignore case while parsing the command line options because we're using
+	# 2 options which share the same character but with a different case. Default this
+	# is set to 1 ( = true ), so we're changing it to 0.
+	$Getopt::Long::ignorecase = 0;
+
+	# Initialize arguments
+	GetOptions	(
+					\%args,
+					"h",
+					"q",
+					"d",
+					"dd",
+					"a",
+					"r",
+					"c",
+					"ne",
+					"no",
+					"np",
+					"nh",
+					"nl",
+					"y",
+					"help",
+					"b:s",
+					"e:s",
+					"g:s",
+					"l:s",
+					"w:s",
+					"W:s",
+					"f:s",
+					"t:s",
+			);
+
+	# // Activate debugging mode
+	if ($args{'d'} || $args{'dd'}) {
+		$$co{'debug'} = 1;
+		debug ("You woke up my debugging mode");
+		# Activate dry run. Commands won't be executed.
+		if ($args{'dd'}) {
+			debug ("We're also performing a gory dry-run. No external commands will be executed");
+			$$co{'Exec'} = 0;
+		} else {
+			$$co{'Exec'} = 1;
+		}
+	}
+	# --
+
+	# // Bind address
+	if ($args{'b'})	{
+		if ($args{'b'} =~ /([\w\d\.]+)/) {
+			$$co{'bindAddress'} = $1;
+			debug ("Setting bind address to user specified value $$co{'bindAddress'}");
+		} else {
+			usage ("Please provide a valid hostname or IP address with -b");
+		}
+	}
+	# --
+
+	# // Timeout
+	if ($args{'t'}) {
+		if ($args{'t'} =~ /([0-9]+)/) {
+			$$co{'timeout'} = $1;
+			debug ("Setting timeout to user specified value $$co{'timeout'}");
+		} else {
+			usage ("Please provide a numerical value with -t");
+		}
+	}
+	# --
+
+	# // Show usage message
+	usage if ($args{'h'} || $args{'help'} || ($noArgs < 1));
+	# --
+
+	# // Set host file
+	if ($args{'f'}) {
+		if (! ($args{'f'} =~ /^\s*$/)) {
+			$$co{'hostFile'} = $args{'f'};		
+		} else {
+			usage ("-f option needs a filename");
+		}
+	} elsif ($$co{'hostFile'} && -r $$co{'hostFile'}) {
+			debug ("Using user hostFile $$co{'hostFile'} from user config");
+	} elsif ($ENV{'DSSHCOLL'} && -r $ENV{'DSSHCOLL'}) {
+			debug ("Using environment hostFile $ENV{'DSSHCOLL'}");
+			$$co{'hostFile'} = $ENV{'DSSHCOLL'};
+	} else {
+		# The default host file is <user homedir>/.sshcoll
+		$$co{'hostFile'} = ($uHome."/.sshcoll");
+
+		# If the defHostFile doesn't exist, the user should specify one
+		if ((! -f $$co{'hostFile'}) && (! $args{'w'})) {
+			usage ("Default hostfile $$co{'hostFile'} doesn't exist. ".
+				" Please specify one using -f\nor specify individual hosts using -w.");
+		}
+	}
+	# --
+
+	# // Command line hosts
+	if ($args{'w'}) {
+		usage ("-w option needs one or more hostnames separated by a comma") if ($args{'w'} =~ /^\s*$|^\s*-/);
+		$$co{'paramHost'} = $args{'w'};
+		$$co{'groups'} = "";
+	}
+	# --
+
+	# // Command line hosts add
+	$$co{'paramHostAdd'} = $args{'W'} if $args{'W'};
+	# --
+
+	# // Command line hosts to exclude
+	$$co{'paramHostEx'} = $args{'e'} if $args{'e'};
+	# --
+
+	# // STDERR output
+	if ($args{'ne'}) {
+    		debug ("We're not going to show STDERR output");
+		$$co{'showErr'} = 0;
+	}
+	#--
+
+	# // STDOUT output
+	if ($args{'no'}) {
+    		debug ("We're not going to show STDOUT output");
+		$$co{'showOut'} = 0;
+	}
+	#--
+
+	# // Exclusive check	
+	usage ("You can't use -e and -s at the same time") if (!($$co{'showOut'} || $$co{'showErr'}));
+	# --
+
+	# // Pretty output
+	if ($args{'np'}) {
+		debug ("We're not going to show separators");
+		$$co{'pretty'} = 0;
+	}
+	#--
+
+	# // Hostnames in front of output
+	if ($args{'nh'}) {
+		debug ("We're not going to show the hostname before every line");
+		$$co{'showHost'} = 0;
+	}
+	# --
+
+	# // Empty lines
+	if ($args{'nl'}) {
+		debug ("We're not going to show empty lines");
+		$$co{'showEmpty'} = 0;
+	}
+	# --
+
+	# // Groups
+	if (! $args{'w'} && ($args{'g'} || $$co{'groups'})) {
+
+		$$co{'groups'} = $args{'g'} if $args{'g'};
+
+		if ($$co{'groups'} !~ m/^[\s\d\w\,]+$/) {
+			error ("The groups definition is invalid. Please correct: \"$$co{'groups'}\"");
+			exit (8);
+		}
+
+		debug ("We're using host groups \"$$co{'groups'}\"");
+	}
+	# --
+
+	# // User
+	if ($args{'l'}) {
+		if (! ($args{'l'} =~ /^\s*$/)) {
+			$$co{'user'} = $args{'l'};		
+			debug ("Setting command line user $$co{'user'}");
+		} else {
+			usage ("-l option needs a username");
+		}
+	}
+	# --
+
+	# // Show current hosts
+	if ($args{'q'}) {
+		$$co{'showHostList'} = 1;
+	} else {
+		$$co{'showHostList'} = 0;
+	}
+	# --
+
+	# // Recursive copy
+	if ($args{'r'}) {
+		debug ("Setting recursive copy");
+		$$co{'recursiveCopy'} = 1;
+	} else {
+		$$co{'recursiveCopy'} = 0;
+	}
+	#--
+
+	# // Activity bar
+	if ($args{'a'}) {
+		$$co{'showActivity'} = ($args{'a'} && ($co{'pretty'}));
+		debug ("Activating activity bar");
+	} else {
+		$$co{'showActivity'} = 0;
+	}
+	#--
+
+	# // Concurrent childs
+	# The maximum number of processes which might be forked at once.
+	# Using more than 10 processes will create an enormous load on
+	# your server. Also, more than 10 simultaneous sessions might result
+	# in ssh-agent not being able to handle all authentication requests.
+	# This setting can not be changed using the command line, but it can
+	# be changed by specifying its value in the user's personal config
+	# file.
+	$$co{'maxConcurrentChilds'} = $$co{'maxConcurrentChilds'} || 10;
+	#--
+
+	# // Compress output
+	# We also need to check of compress has already been set in the user
+	# config file. If it is, the pretty and showActivity options also need
+	# to be turned off.
+	if ($args{'c'} || $$co{'compress'}) {
+		debug ("Activating compressed output");
+		$$co{'compress'} = 1;
+		$$co{'pretty'} = 0;
+		$$co{'showActivity'} = 0;
+	}
+	#--
+
+	# // Search ssh
+	if (( -x $$co{'sshCommand'} && -f $$co{'sshCommand'}) || ($$co{'sshCommand'} = findExec ("ssh", @searchPath))){
+		debug ("Found ssh at $$co{'sshCommand'}");
+	} else {
+		error ("Couldn't find ssh. Exiting");
+		exit (6);
+	}
+	#--
+
+	# // Search scp
+	if (( -x $$co{'scpCommand'} && -f $$co{'scpCommand'}) || ($$co{'scpCommand'} = findExec ("scp", @searchPath))){
+		debug ("Found scp at $$co{'scpCommand'}");
+	} else {
+		error ("Couldn't find scp. Exiting");
+		exit (7);
+	}
+	# --
+
+	# // Check limit
+	$$co{'checkLimit'} = ! defined ($args{'y'});
+	# --
+
+	debug ("--");
+}
+
+sub dumpConfig ($) {
+	my $rConfig = shift;
+	my $key;
+
+	debug ("-- Entering dumpConfig");
+
+	foreach $key (sort(keys(%$rConfig))) {
+		debug ("\tKey=$key\t\tValue=$rConfig->{$key}");
+	}
+
+	debug ("--");
+}
+# -|Main program|-----------------------------------------------------
+
+# This needs te be unhashed when you want to debug the setDefaults and
+# readConf functions because they are executed before the debug variable
+# is set.
+# $co{'debug'} = 1; #gdeb
+
+setDefaults (\%co);
+
+# Let the user know our current pid.
+debug ("My pid = $$ and I am $<");
+
+debug ("My home is $uHome");
+
+# Read configuration file if we have one
+readConf ($uHome."/.dssh", \%co) if (-e $uHome."/.dssh");
+
+setOptions (\%co);
+
+# Replace the current host list with the user defined hosts.	
+if ($co{'paramHost'}) {
+	debug("Using command line or user config supplied hosts");
+	@hostList = parseHost ($co{'paramHost'});	
+
+} else {
+	@hostList = readHostFile ($co{'hostFile'});
+}
+
+if ($co{'paramHostAdd'}) {
+	# Append the additional hosts to the current host list.
+	debug ("Appending command line supplied hosts to existing list");
+
+	push (@hostList, parseHost ($co{'paramHostAdd'}));	
+}
+
+# Remove newlines from all hosts in array
+cleanHosts (\@hostList, $co{'groups'});
+
+# If the hostList is empty, there's nothing to execute. Exit program.
+if (@hostList < 1) {
+	error ("No hosts defined. Check command line params, host files or user configuration file.");
+	exit (9);
+}
+
+# Show the list of configured hosts.
+if ($co{'showHostList'}) {
+	print ("Current hosts (".@hostList.")\n");
+	listHosts (@hostList);
+
+	# Clean exit
+	exit;
+}
+
+if ((@hostList >= $hostLimit) && $co{'checkLimit'}) {
+	error ("You've specified more than $hostLimit hosts. If you want to proceed, use the -y flag.");
+	exit (10);
+}
+
+dumpConfig (\%co) if $co{'debug'};
+
+# Identity crisis.. What are we going to do ?? :(
+if ($progName =~ /^dssh$/) {
+
+	debug ("Hey, I'm dssh");
+	# Get the command
+	$command = join (" ", @ARGV);
+
+	# Check command
+	usage ("No command entered or command contains invalid characters")
+		 if ((! $command) || checkCommand ($command, \%hotList, int(@hostList)));
+
+	print ("Executing \"$command\" - Hold on..\n") if $co{'pretty'};
+
+	# Execute the SSH sessions
+	@sshOpts = ($co{'sshCommand'}, "-o PasswordAuthentication=no", "-o StrictHostKeyChecking=no", "-n");
+	# --
+	push (@sshOpts, "-o BindAddress=".$co{'bindAddress'}) if $co{'bindAddress'};
+
+	execCommand (\@sshOpts, $co{'user'}, $command, $co{'maxConcurrentChilds'}, $co{'showActivity'},
+		\$activityCounter, "ssh", @hostList);
+
+} elsif ($progName =~ /^dscp$/) {
+
+	debug ("Hey, I'm dscp");
+
+	# The first argument should be the source filename
+	$filename = $ARGV[0];
+
+	usage ("Please supply a existing file or directory") if ((! defined ($filename)) ||
+		checkCopySource ($filename, $co{'recursiveCopy'}));
+
+	debug ("filename = $filename");
+
+	# The second argument should be the destination filename, or directory or nothing.
+	# In the last case, the remote users home directory (.) will be used.
+	$destFilename = $ARGV[1] || ".";
+
+	debug ("destFilename = $destFilename");
+
+	print ("Copying \"$filename\" - Hold on..\n");
+
+	if ($co{'recursiveCopy'}) {
+		@scpOpts = ($co{'scpCommand'}, "-r", "-B", "-q", "-o PasswordAuthentication=no",
+			"-o StrictHostKeyChecking=no", $filename);
+	} else {
+		@scpOpts = ($co{'scpCommand'}, "-B", "-q", "-o PasswordAuthentication=no",
+			"-o StrictHostKeyChecking=no", $filename);
+	}
+
+	push (@sshOpts, "-o BindAddress=".$co{'bindAddress'}) if $co{'bindAddress'};
+
+	execCommand (\@scpOpts, $co{'user'}, ${destFilename}, $co{'maxConcurrentChilds'}, $co{'showActivity'},
+		\$activityCounter, "scp", @hostList);
+
+} else {
+	print ("Help !!! Who am I ???\n");
+	exit (4);
+}
+
+# Show pids of forked childs
+debug ("Forked the following pids: ".join(",",@pids));
+
+# Wait for all child processes to finish
+debug ("Waiting for all childs to die.");
+eval {
+	alarm ($co{'timeout'} + $globalDiff);
+	for (1..@hostList) {
+		wait;
+		printActivity (\$activityCounter) if $co{'showActivity'};
+	}
+	alarm (0);
+};
+
+print ("\n") if $co{'showActivity'};
+
+if ($@) {
+	error ("Some child processes didn't terminate within the $co{'timeout'} second timeout.") if ($@ =~ /timeout/);
+} else {
+	debug ("All child processes successfully terminated");
+}
+			
+createOutput (\@hostList,\@hostOutput);
+
+if ($co{'compress'}) {
+	printOutputCompress (\@hostOutput);
+} else {
+	printOutput (\@hostOutput);
+}
+
+__END__
+
+=head1 dssh
+
+dssh - Distributed execution of commands
+
+=head1 VERSION
+
+$Revision: 2.24 $
+
+=head1 SYNOPSIS
+
+B<dssh> [B<-h>]
+
+B<dssh> S<[B<-w> I<host1,host2> | B<-W> I<host1,host2>]>
+     S<[B<-f> I<hostfile1,hostfile2>]> [B<-q>]
+
+B<dssh> S<[B<-w> I<host1,host2> | B<-W> I<host1,host2>]>
+     S<[B<-f> I<hostfile1,hostfile2>]>
+     S<[B<-c> | [[B<-a>] [B<-ne>] [B<-no>] [B<-nl>] [B<-np>] [B<-no>]]>
+     S<[B<-g> I<server group>]> S<[B<-l> I<login name>]>
+     S<[B<-t> I<time out>]> I<command>
+
+=head1 DESCRIPTION
+
+=head2 What is dssh
+
+dssh stands for distributed secure shell. It's derived from the dsh implementation as included by IBM in their PSSP software. The major difference is, that dssh supports executing remote commands using SSH rather than the unsecure rsh. Furthermore some dsh features are missing while other features have been added. dssh Is YABA compatible.
+
+=head2 Command line options
+
+=over 4
+
+=item B<-h>
+
+Help message
+
+=item B<-w> I<host1,host2>
+
+Specify one or multiple hosts, separated by commas, on which the command should be executed.
+
+=item B<-W> I<host1,host2>
+
+Specify one or multiple hosts, separated by commas, on which the command should be executed which will be added to the default list.
+
+=item B<-f> I<hostfile1,hostfile2>
+
+Specify the host file. Multiple host files should be separated by a comma. Use absolute filenames.
+
+=item B<-q>
+
+List the hosts. This won't execute any commands.
+
+=item B<-a>
+
+Show an activity bar. Will not be shown when B<-np> or B<-c> is specified.
+
+=item B<-l> I<login name>
+
+Remote login name. Default is current user name.
+
+=item B<-t> I<timeout>
+
+Specify the per process time out. This defaults to 60 seconds.
+
+=item B<-c>
+
+Compress output. Emulates the behaviour of dshbak and summarizes the output of hosts which have the same output.
+
+=item B<-g> I<group1,group2>
+
+Server group. When specified, only processes servers which belong to this group. Multiple groups shoud be separated by a comma.
+
+=item B<-ne>
+
+Don't display standard error output from remote command. Can't be used together with B<-no>.
+
+=item B<-no>
+
+Don't display standard output from remote command. Can't be used together with B<-ne>.
+
+=item B<-nh>
+
+Don't display the hostname in front of every line.
+
+=item B<-nl>
+
+Removes empty lines from output.
+
+=item B<-np>
+
+Don't display separators.
+
+=back
+
+=head1 A SHORT INTRODUCTION
+
+Before using dssh, make sure you have distributed your public keys to all the hosts you want to access. Furthermore, you need to use an unencrypted key (not recommended) or setup ssh-agent (prefered). The last option will give you the benefit of using an unencrypted key, while the private key is still encrypted.
+
+The following command is an example of how to execute the command C<S<ls -l>> on the host nlassv66 using dssh:
+
+C<dssh -w nlassv66 -- ls -l>
+
+
+Using the B<-w> option you can specify one or multiple hosts on which you want to execute the command. Multiple hosts should be separated by a comma. Everything that's typed after the -- won't be evaluated as an argument. If you want to be sure that a command won't get evaluated by dssh or the shell, place the command between quotes. Example:
+
+C<dssh -w nlassv66,nlassv67 "ls -l">
+
+
+When you enter dssh with a command, but without any options:
+
+C<dssh "ls -l">
+
+
+dssh will try to locate the default collective file, which is C<~/.sshcoll>, read the hosts which are in the file and execute the command on these hosts.
+
+When you want to specify your own coll file, use the B<-f> parameter:
+
+C<dssh -f F</home/E<lt>userE<gt>/.sshcoll.ce> "ls -l">
+
+
+The B<-w> options will override the coll file specified by B<-f>.
+
+You can supply multiple coll files. Seperate them by a comma:
+
+S<C<dssh -f F</home/E<lt>userE<gt>/.sshcoll.ce>,F</home/E<lt>userE<gt>/.sshcoll.li> "ls -l">>
+
+
+When you specify a coll file and you want to add hosts which are missing from that file, use the B<-W> options. This will add the specified hosts to the host list:
+
+S<C<dssh -f F</home/E<lt>userE<gt>/.sshcoll.ce> -W myhost1,myhost2 "ls -l">>
+
+
+This will also work:
+
+C<dsh -w myhost1,myhost2 -W myhost3,myhost4 "ls -l">
+
+
+If you want to see the hosts on which a command will be executed, use the B<-q> option.
+
+C<dssh -f F</home/E<lt>userE<gt>/.sshcoll.ce> -W myhost1,myhost2 -q>
+
+
+When executing a command on multiple hosts, it might take long before dssh is finished. To see if dssh is still active, use to B<-a> option to display an activity symbol. Whenever a command gets executed or is finished, the symbol will change.
+
+C<dssh -a "ls -l">
+
+
+The default user for dssh commands is the current user name. If you want your commands to be executed as a different user, specify one using the B<-l> option:
+
+C<dssh -l E<lt>myuserE<gt> "ls -l">
+
+
+When a command is executed, a maximum time for executing will be set. When this has expired, the command will be killed. The default time is 60, which might be too short for some commands to finish. Therefore you can specify the timout using the B<-t> option:
+
+C<dssh -t 65 "sleep 60">
+
+
+On AIX systems which have PSSP installed, there's a program called dshbak. This program collects output from the dsh command and 'compresses' it. When the output for certain hosts is the same, that output will only be printed once.
+
+C<dssh -c "ls /usr/bin">
+
+
+If you don't want to see the standard error output from a command, use the B<-ne> options:
+
+C<dssh -ne "ls -l idontexist">
+
+
+If you don't want to see the standard output from a command, use the B<-no> options:
+
+C<dssh -no "ls -l">
+
+
+Empty lines can be filtered by using the B<-nl> option:
+
+C<dssh -nl "echo '';echo hi;echo ''">
+
+
+If you only need the output without the fancy separators, use the B<-np> option.
+
+C<dssh -np "ls -l">
+
+
+To leave out the hostname, use -nh:
+
+C<dssh -nh "ls -l">
+
+
+=head2 Groups
+
+When you have a coll file for a certain customer, it might also be nice if there was another way of selecting hosts within that file without specifing them on the command line. This can be done using groups. A group is an identifier in a coll file, which groups together one or more hosts. Lets say that the following output is from our coll file and contains 6 hosts.
+
+  host1
+  host2
+  host3
+  host4
+  host5
+  host6
+
+Now imagine, that host1 and host2 belong to SAP instance HB1, while host3 and host4 are CWS's. When you want to execute a command on the CWS's you have three options. Specify the hosts on the command line using the B<-w> option, create a separate coll file or create groups in the current coll file. We'll take the last option.
+
+  @CWS:host3,host4
+  @HB1:host1,host2
+  host5
+  host6
+
+If you want to execute a command on all the servers in your coll file, you can use dssh without any additional parameters:
+
+C<dssh "ls -l">
+
+dssh will totally ignore the groups and create a list from all the hosts in your coll file. But what if you only want to execute a command on the CWS's (host3 and host4)? Then you should use the B<-g> option to specify the group:
+
+C<dssh -g CWS "ls -l">
+
+You can also specify multiple groups. Seperate them by a comma.
+
+C<dssh -g CWS,HB1 "ls -l">
+
+Furthermore, it's also possible for a host to belong to multiple groups. Whenever a command gets executed and a host has multiple entries in the coll file, dssh will remove the duplicates internally.
+
+Another example:
+
+  @CE:host1,host2,host3,host4
+  @LI:host5,host6,host7,host8
+  @CLASS:host9,host10
+  @CECWS:host1,host3
+  @LICWS:host5,host8
+  @TSM:host8
+  @HB1:host1
+  @HB2:host2
+
+
+=head2 User configuration
+
+A user can create its own personal configuration file in which he can set some default settings which affect the behaviour of dssh. These settings shoud be placed in F<E<lt>userhomeE<gt>/.dssh> . The format of this file is:
+
+E<lt>identifierE<gt>=E<lt>valueE<gt>
+
+Just like other configuration files, the lines can be commented out, or a comment can be put in at the end of a line. The user can specify the following identifiers:
+
+=over 4
+
+=item B<Exec> I<[0|1]>
+
+Don't execute commands (0)
+
+=item B<timeout> I<seconds>
+
+Per process time out in seconds
+
+=item B<hostFile> I<hostfile>
+
+Absolute path to the default collective host file
+
+=item B<groups> I<group1,group2>
+
+Default host group(s)
+
+=item B<showErr> I<[0|1]>
+
+Don't display standard error output (0)
+
+=item B<showOut> I<[0|1]>
+
+Don't display standard output (0)
+
+=item B<showHost> I<[0|1]>
+
+Don't display hostname at beginning of line (0)
+
+=item B<pretty> I<[0|1]>
+
+Don't display separators (0)
+
+=item B<user> I<username>
+
+User as which the commands will be execute on the remote hosts
+
+=item B<maxConcurrentChilds> I<number>
+
+Set the maximum number of processes that can be running at the same time. Don't touch this setting unless you know what your doing !!!
+
+=item B<compress> I<[0|1]>
+
+Compress output (1)
+
+=back 
+
+Example
+
+  user=nlsysmgr
+  hostFile=/home/<user>/.sshcoll.int
+  compress=1
+  groups=CWS,DNS
+
+When a user issues a dssh command without any additional parameters the command will be executed as user nlsysmgr, on hosts in the file F</home/E<lt>userE<gt>/.sshcoll.int> which belong to the groups CWS or DNS and compressed
+output.
+
+=item B<bindAddress> I<IP adress or hostname>
+
+Host of which the connection will be originating. This is usefull for hosts which have multiple network adapter.
+
+=head1 AUTHOR
+
+alexdepalex
+
+=head1 KNOWN BUGS
+
+yes
+
+=head1 REPORTING BUGS
+
+Report bugs to me
+
+=head1 COPYRIGHT
+
+yes
